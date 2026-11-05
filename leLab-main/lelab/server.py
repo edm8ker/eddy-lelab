@@ -38,6 +38,7 @@ from starlette.types import Scope
 
 # Import our custom recording functionality
 from . import camera_preview, datasets as dataset_browser, record as _record
+from .browser_recording import handle_browser_recording
 
 # Import our custom calibration functionality
 from .calibrate import CalibrationRequest, calibration_manager
@@ -489,6 +490,12 @@ def datasets_list():
 def websocket_test():
     """Test endpoint to verify WebSocket support"""
     return {"websocket_endpoint": "/ws/joint-data", "status": "available"}
+
+
+@app.websocket("/ws/browser-recording")
+async def browser_recording_websocket(websocket: WebSocket):
+    """Record a dataset for an arm the browser drives (see lelab/browser_recording.py)."""
+    await handle_browser_recording(websocket)
 
 
 @app.websocket("/ws/joint-data")
