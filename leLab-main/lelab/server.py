@@ -30,7 +30,7 @@ from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconn
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from starlette.datastructures import Headers
 from starlette.exceptions import HTTPException as StarletteHTTPException
 from starlette.responses import Response
@@ -445,6 +445,32 @@ def remote_server_stop():
     from . import remote_server
 
     return remote_server.stop()
+
+
+class RemoteActRequest(BaseModel):
+    policy_ref: str
+    # Camera name -> base64 JPEG, as remote_rollout.py sends them.
+    images: dict[str, str] = Field(default_factory=dict, max_length=4)
+    state: list[float] = Field(max_length=32)
+    task: str = Field(default="", max_length=500)
+
+
+@app.post("/remote-server/act")
+def remote_server_act(request: RemoteActRequest):
+    """One plan for an arm the browser drives (eddy-fe's browser mode): the
+    browser runs remote_rollout.py's loop itself and asks for each plan here,
+    because only this server holds the token the cloud GPU needs."""
+    from . import remote_server
+
+    try:
+        return remote_server.act(
+            request.policy_ref,
+            {"images": request.images, "state": request.state, "task": request.task},
+        )
+    except ValueError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    except remote_server.CloudActError as exc:
+        raise HTTPException(status_code=502, detail=str(exc)) from exc
 
 
 @app.get("/inference-status")
