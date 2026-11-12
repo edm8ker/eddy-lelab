@@ -316,3 +316,59 @@ def ready_url(policy_ref: str) -> str:
         raise ValueError("The cloud GPU has a different training loaded. Load this one first.")
     with _lock:
         return _server["url"]
+
+
+# ---- arm loop in the browser ------------------------------------------------
+
+# Same limit as remote_rollout.py's requests.
+ACT_TIMEOUT_S = 5.0
+_act_client = None
+
+
+class CloudActError(Exception):
+    """The cloud GPU didn't answer a plan request, or answered with an error."""
+
+
+def _http():
+    """One connection to the cloud GPU, kept open between plan requests: a new
+    TLS handshake to the jobs proxy per plan would add to every round trip."""
+    global _act_client
+    import httpx
+
+    with _lock:
+        if _act_client is None:
+            _act_client = httpx.Client(timeout=ACT_TIMEOUT_S)
+        return _act_client
+
+
+def act(policy_ref: str, body: dict[str, Any]) -> dict[str, Any]:
+    """Pass one plan request from an arm the browser drives to the cloud GPU.
+
+    The browser can't call the cloud GPU itself: the jobs proxy needs this
+    server's Hugging Face token. The body is remote_policy_server.py's /act
+    request ({"images", "state", "task"}), and its reply comes back as is.
+    Unlike ready_url, this doesn't ask Hugging Face for the job's state on
+    every request (they come about once a second): the page keeps polling
+    /remote-server/status, which keeps the address current, and the cloud
+    GPU itself answers 503 while a model is still loading.
+    """
+    with _lock:
+        server = dict(_server)
+    if not server.get("job_id") or not server.get("url"):
+        raise ValueError("The cloud GPU isn't ready yet. Start it first and wait until it says ready.")
+    if server.get("policy_ref") != policy_ref:
+        raise ValueError("The cloud GPU has a different training loaded. Load this one first.")
+    _, token = _hf()
+    import httpx
+
+    try:
+        reply = _http().post(server["url"] + "/act", json=body, headers={"Authorization": f"Bearer {token}"})
+    except httpx.HTTPError as exc:
+        raise CloudActError(f"The cloud GPU did not answer: {type(exc).__name__}") from exc
+    if reply.status_code != 200:
+        try:
+            detail = reply.json().get("error")
+        except ValueError:
+            detail = reply.text[:200]
+        raise CloudActError(f"The cloud GPU answered {reply.status_code}: {detail}")
+    return reply.json()
