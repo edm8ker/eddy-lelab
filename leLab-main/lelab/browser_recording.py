@@ -74,8 +74,8 @@ def _is_side(value: Any) -> bool:
     return type(value) is int and 0 < value <= MAX_CAMERA_SIDE
 
 
-def parse_start(message: dict[str, Any]) -> tuple[str, str, int, dict[str, tuple[int, int]]]:
-    """Check a start message. Returns (dataset name, task, fps, {camera: (height, width)})."""
+def parse_start(message: dict[str, Any]) -> tuple[str, str, int, dict[str, tuple[int, int]], bool]:
+    """Check a start message. Returns (dataset name, task, fps, {camera: (height, width)}, resume)."""
     name = message.get("dataset_name")
     if (
         not isinstance(name, str)
@@ -108,7 +108,10 @@ def parse_start(message: dict[str, Any]) -> tuple[str, str, int, dict[str, tuple
         ):
             raise BrowserRecordingError(f"Camera {camera!r} needs a plain name, a width and a height.")
         cameras[camera] = (size["height"], size["width"])
-    return name, task.strip(), fps, cameras
+    resume = message.get("resume", False)
+    if type(resume) is not bool:
+        raise BrowserRecordingError("resume must be true or false.")
+    return name, task.strip(), fps, cameras, resume
 
 
 def _joint_values(header: dict[str, Any], key: str) -> np.ndarray:
@@ -178,7 +181,14 @@ def decode_frame(
 class BrowserRecording:
     """One browser's dataset, from its start message to its upload."""
 
-    def __init__(self, repo_id: str, task: str, fps: int, cameras: dict[str, tuple[int, int]]) -> None:
+    def __init__(
+        self,
+        repo_id: str,
+        task: str,
+        fps: int,
+        cameras: dict[str, tuple[int, int]],
+        resume: bool = False,
+    ) -> None:
         self.repo_id = repo_id
         self.task = task
         self.cameras = cameras
@@ -188,6 +198,9 @@ class BrowserRecording:
         self.kept: list[int] = []
         self.deleted: set[int] = set()
 
+        if resume:
+            self.dataset = self._resume(fps)
+            return
         if self.root.exists():
             raise BrowserRecordingError(f"A dataset named {repo_id} already exists on this server.")
         motors: dict[str, Any] = {f"{motor}.pos": float for motor in MOTORS}
@@ -207,6 +220,32 @@ class BrowserRecording:
             },
             use_videos=True,
             image_writer_threads=IMAGE_WRITER_THREADS_PER_CAMERA * len(cameras),
+            streaming_encoding=False,
+        )
+
+    def _resume(self, fps: int) -> LeRobotDataset:
+        """Open this server's copy of an earlier recording to add episodes to it,
+        possibly with a different task (e.g. a second phase of a lesson)."""
+        info_path = self.root / "meta" / "info.json"
+        if not info_path.exists():
+            raise BrowserRecordingError(
+                f"The recording {self.repo_id} isn't on this server anymore. Start a new dataset."
+            )
+        # Checked before opening, so a refused session leaves no writer behind.
+        info = json.loads(info_path.read_text())
+        recorded = {
+            key.removeprefix("observation.images."): tuple(feature["shape"][:2])
+            for key, feature in info.get("features", {}).items()
+            if key.startswith("observation.images.")
+        }
+        if recorded != self.cameras or info.get("fps") != fps:
+            raise BrowserRecordingError(
+                f"Use the same cameras as the first recording of {self.repo_id} to add to it."
+            )
+        return LeRobotDataset.resume(
+            self.repo_id,
+            root=self.root,
+            image_writer_threads=IMAGE_WRITER_THREADS_PER_CAMERA * len(self.cameras),
             streaming_encoding=False,
         )
 
@@ -301,10 +340,10 @@ def _account_name() -> str:
 async def _start_session(message: dict[str, Any]) -> BrowserRecording:
     if message.get("type") != "start":
         raise BrowserRecordingError('The first message must be {"type": "start", ...}.')
-    name, task, fps, cameras = parse_start(message)
+    name, task, fps, cameras, resume = parse_start(message)
     # The server picks the account, so a page can only write to this server's.
     account = await asyncio.to_thread(_account_name)
-    return await asyncio.to_thread(BrowserRecording, f"{account}/{name}", task, fps, cameras)
+    return await asyncio.to_thread(BrowserRecording, f"{account}/{name}", task, fps, cameras, resume)
 
 
 async def _finish_session(websocket: WebSocket, session: BrowserRecording) -> None:
@@ -337,7 +376,9 @@ async def handle_browser_recording(websocket: WebSocket) -> None:
     """Serve one browser recording session over an accepted-on-entry WebSocket.
 
     Protocol: the page sends {"type": "start", "dataset_name", "task", "fps",
-    "cameras": {name: {"width", "height"}}}; the server answers {"type":
+    "cameras": {name: {"width", "height"}}, "resume"?}; "resume": true adds
+    episodes to this server's copy of an earlier dataset of that name, with the
+    same cameras, instead of starting a new one. The server answers {"type":
     "ready", "dataset_repo_id"}. Each binary message is a frame of the current
     episode (see decode_frame). Then, each answered once the frames sent before
     it are done:
