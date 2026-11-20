@@ -118,6 +118,7 @@ def finish(ws) -> list[dict]:
         {"fps": 30.5},
         {"cameras": {"../top": {"width": WIDTH, "height": HEIGHT}}},
         {"cameras": {"top": {"width": 0, "height": HEIGHT}}},
+        {"resume": "yes"},
     ],
 )
 def test_parse_start_rejects(change: dict) -> None:
@@ -126,7 +127,7 @@ def test_parse_start_rejects(change: dict) -> None:
 
 
 def test_parse_start_defaults() -> None:
-    assert parse_start(START) == ("my_arm_k3f9x2", "Pick up the cube", 30, {"top": (HEIGHT, WIDTH)})
+    assert parse_start(START) == ("my_arm_k3f9x2", "Pick up the cube", 30, {"top": (HEIGHT, WIDTH)}, False)
 
 
 def test_decode_frame() -> None:
@@ -273,6 +274,44 @@ def test_existing_name_is_refused(client: TestClient, home: Path, push: MagicMoc
         reply = start(ws)
     assert reply["type"] == "error"
     assert "already exists" in reply["message"]
+
+
+def test_resume_adds_episodes_with_another_task(client: TestClient, home: Path, push: MagicMock) -> None:
+    with client.websocket_connect("/ws/browser-recording") as ws:
+        start(ws)
+        record_episode(ws, 1.0)
+        finish(ws)
+    with client.websocket_connect("/ws/browser-recording") as ws:
+        ws.send_text(json.dumps({**START, "task": "Sort the orange cube", "resume": True}))
+        assert ws.receive_json() == {"type": "ready", "dataset_repo_id": f"{ACCOUNT}/my_arm_k3f9x2"}
+        assert record_episode(ws, 2.0)["saved_episodes"] == 1
+        assert finish(ws)[-1]["uploaded"] is True
+
+    dataset = open_dataset(home)
+    assert dataset.num_episodes == 2
+    assert [dataset[i]["task"] for i in (0, 3)] == ["Pick up the cube", "Sort the orange cube"]
+
+
+def test_resume_needs_the_dataset_on_this_server(client: TestClient, home: Path, push: MagicMock) -> None:
+    with client.websocket_connect("/ws/browser-recording") as ws:
+        ws.send_text(json.dumps({**START, "resume": True}))
+        reply = ws.receive_json()
+    assert reply["type"] == "error"
+    assert "isn't on this server" in reply["message"]
+
+
+def test_resume_needs_the_same_cameras(client: TestClient, home: Path, push: MagicMock) -> None:
+    with client.websocket_connect("/ws/browser-recording") as ws:
+        start(ws)
+        record_episode(ws, 1.0)
+        finish(ws)
+    with client.websocket_connect("/ws/browser-recording") as ws:
+        other = {"side": {"width": WIDTH, "height": HEIGHT}}
+        ws.send_text(json.dumps({**START, "cameras": other, "resume": True}))
+        reply = ws.receive_json()
+    assert reply["type"] == "error"
+    assert "same cameras" in reply["message"]
+    assert open_dataset(home).num_episodes == 1
 
 
 def test_server_not_logged_in(client: TestClient, home: Path, monkeypatch: pytest.MonkeyPatch) -> None:
